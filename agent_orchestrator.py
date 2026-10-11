@@ -4,10 +4,14 @@ The model chooses the next tool from an allowlisted registry, reads the result, 
 another tool or answers. Python owns every number; the model only plans and explains.
 No trade execution exists anywhere in this module by design.
 """
-import json, logging, re, time
+import json, logging, operator, re, time
+from types import SimpleNamespace
+from typing import Annotated, Optional, TypedDict
+
+from langgraph.graph import StateGraph, START, END
 
 from config import AGENT_MODEL, AGENT_MAX_STEPS, AGENT_MAX_TOOL_CALLS, AGENT_TIME_BUDGET_S
-from state.schemas import AgentState
+from state.schemas import fail
 from tools.registry import TOOL_REGISTRY, openai_tool_schemas, execute_tool_safely
 
 log = logging.getLogger("agent")
@@ -87,65 +91,113 @@ def _summary(res):
     return "ok" if res["ok"] else f"{res['error_code']}: {res['error']}"[:160]
 
 
-# ---------------------------------------------------------------- runtime
+# ---------------------------------------------------------------- graph
+class AgentGraphState(TypedDict):
+    user_query: str
+    user_id: str
+    messages: Annotated[list, operator.add]
+    tool_results: Annotated[list, operator.add]
+    trace: Annotated[list, operator.add]
+    missing_data: Annotated[list, operator.add]
+    seen: dict                 # (tool,args) -> {ok, tries}, for duplicate/retry control
+    pending: list              # tool calls requested by the latest plan step
+    answer: Optional[str]
+    iteration: int
+    tool_calls_used: int
+    started: float
+    stop: bool
+    result: dict
+
+
 class AgentOrchestrator:
+    """plan -> (final answer | act) -> plan ... -> finish, as a LangGraph with hard limits."""
+
     def __init__(self, decide=None, max_steps=AGENT_MAX_STEPS, max_tool_calls=AGENT_MAX_TOOL_CALLS,
                  time_budget=AGENT_TIME_BUDGET_S):
         self.decide = decide or openai_decide
         self.max_steps, self.max_tool_calls, self.time_budget = max_steps, max_tool_calls, time_budget
         self.tools = openai_tool_schemas()
+        self.graph = self._build_graph()
 
-    def run(self, user_query, user_id):
-        st = AgentState(user_query=user_query, user_id=user_id)
-        st.messages = [{"role": "system", "content": SYSTEM_PROMPT},
-                       {"role": "user", "content": user_query}]
-        seen = {}           # (tool, args-json) -> attempts
-        trace, answer = [], None
+    # -- nodes
+    def _plan(self, s):
+        if time.time() - s["started"] > self.time_budget:
+            return {"missing_data": ["time budget exhausted"], "stop": True}
+        it = s["iteration"] + 1
+        try:
+            d = self.decide(s["messages"], self.tools)
+        except Exception as e:
+            log.error("planner failed: %s", e)
+            return {"iteration": it, "missing_data": [f"planner error: {e}"], "stop": True}
+        if d["type"] == "final":
+            return {"iteration": it, "answer": d["text"], "pending": []}
+        msg = {"role": "assistant", "content": d.get("content"), "tool_calls": [
+            {"id": c["id"], "type": "function",
+             "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}} for c in d["calls"]]}
+        return {"iteration": it, "messages": [msg], "pending": d["calls"]}
 
-        while st.iteration < self.max_steps:
-            if st.elapsed() > self.time_budget:
-                st.missing_data.append("time budget exhausted")
-                break
-            st.iteration += 1
-            try:
-                d = self.decide(st.messages, self.tools)
-            except Exception as e:
-                log.error("planner failed: %s", e)
-                st.missing_data.append(f"planner error: {e}")
-                break
-
-            if d["type"] == "final":
-                answer = d["text"]
-                break
-
-            st.messages.append({"role": "assistant", "content": d.get("content"), "tool_calls": [
-                {"id": c["id"], "type": "function",
-                 "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}} for c in d["calls"]]})
-
-            for c in d["calls"]:
-                name, args = c["name"], c["arguments"]
-                key = (name, json.dumps(args, sort_keys=True, default=str))
-                t0 = time.time()
-                if st.tool_calls_used >= self.max_tool_calls:
-                    res = _blocked("TOOL_BUDGET", f"tool-call budget ({self.max_tool_calls}) used up; answer with what you have")
-                elif key in seen and (seen[key]["ok"] or seen[key]["tries"] >= 2):
-                    res = _blocked("DUPLICATE_CALL", "identical call already made; reuse the earlier result")
-                else:
-                    st.tool_calls_used += 1
-                    res = execute_tool_safely(name, args, user_id, state=st)
-                    prev = seen.get(key, {"tries": 0})
-                    seen[key] = {"ok": res["ok"], "tries": prev["tries"] + 1}
-                    if res["error_code"] in ("NO_PORTFOLIO",):
-                        st.missing_data.append("portfolio")
-                ms = int((time.time() - t0) * 1000)
-                st.tool_results.append({"step": st.iteration, "tool": name, "args": args, "result": res, "ms": ms})
-                trace.append({"step": st.iteration, "tool": name, "args": args, "ok": res["ok"],
+    def _act(self, s):
+        seen = dict(s["seen"])
+        used = s["tool_calls_used"]
+        shim = SimpleNamespace(missing_data=list(s["missing_data"]), tool_results=list(s["tool_results"]))
+        new_msgs, new_results, new_trace, new_missing = [], [], [], []
+        for c in s["pending"]:
+            name, args = c["name"], c["arguments"]
+            key = (name, json.dumps(args, sort_keys=True, default=str))
+            t0 = time.time()
+            if used >= self.max_tool_calls:
+                res = fail(f"tool-call budget ({self.max_tool_calls}) used up; answer with what you have", "TOOL_BUDGET")
+            elif key in seen and (seen[key]["ok"] or seen[key]["tries"] >= 2):
+                res = fail("identical call already made; reuse the earlier result", "DUPLICATE_CALL")
+            else:
+                used += 1
+                res = execute_tool_safely(name, args, s["user_id"], state=shim)
+                seen[key] = {"ok": res["ok"], "tries": seen.get(key, {"tries": 0})["tries"] + 1}
+                if res["error_code"] == "NO_PORTFOLIO":
+                    new_missing.append("portfolio"); shim.missing_data.append("portfolio")
+            ms = int((time.time() - t0) * 1000)
+            rec = {"step": s["iteration"], "tool": name, "args": args, "result": res, "ms": ms}
+            new_results.append(rec); shim.tool_results.append(rec)
+            new_trace.append({"step": s["iteration"], "tool": name, "args": args, "ok": res["ok"],
                               "summary": _summary(res), "ms": ms})
-                log.info("step=%d tool=%s args=%s -> %s (%dms)", st.iteration, name, args, _summary(res), ms)
-                st.messages.append({"role": "tool", "tool_call_id": c["id"],
-                                    "content": json.dumps(res, default=str)})
+            log.info("step=%d tool=%s args=%s -> %s (%dms)", s["iteration"], name, args, _summary(res), ms)
+            new_msgs.append({"role": "tool", "tool_call_id": c["id"], "content": json.dumps(res, default=str)})
+        return {"messages": new_msgs, "tool_results": new_results, "trace": new_trace,
+                "missing_data": new_missing, "seen": seen, "tool_calls_used": used, "pending": []}
 
-        return self._finish(st, answer, trace)
+    def _finish_node(self, s):
+        st = SimpleNamespace(tool_results=s["tool_results"], missing_data=s["missing_data"],
+                             iteration=s["iteration"], tool_calls_used=s["tool_calls_used"], status="running")
+        return {"result": self._finish(st, s["answer"], s["trace"])}
+
+    # -- edges
+    def _after_plan(self, s):
+        return "finish" if s.get("stop") or s.get("answer") is not None else "act"
+
+    def _after_act(self, s):
+        over = s["iteration"] >= self.max_steps or time.time() - s["started"] > self.time_budget
+        return "finish" if over else "plan"
+
+    def _build_graph(self):
+        g = StateGraph(AgentGraphState)
+        g.add_node("plan", self._plan)
+        g.add_node("act", self._act)
+        g.add_node("finish", self._finish_node)
+        g.add_edge(START, "plan")
+        g.add_conditional_edges("plan", self._after_plan, ["act", "finish"])
+        g.add_conditional_edges("act", self._after_act, ["plan", "finish"])
+        g.add_edge("finish", END)
+        return g.compile()
+
+    # -- public
+    def run(self, user_query, user_id):
+        init = {"user_query": user_query, "user_id": user_id,
+                "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_query}],
+                "tool_results": [], "trace": [], "missing_data": [], "seen": {}, "pending": [],
+                "answer": None, "iteration": 0, "tool_calls_used": 0, "started": time.time(),
+                "stop": False, "result": {}}
+        out = self.graph.invoke(init, config={"recursion_limit": self.max_steps * 2 + 10})
+        return out["result"]
 
     def _finish(self, st, answer, trace):
         real = [r for r in st.tool_results if r["result"]["error_code"] not in ("DUPLICATE_CALL", "TOOL_BUDGET")]
@@ -175,8 +227,3 @@ class AgentOrchestrator:
         return {"answer": answer, "status": st.status, "verified": verified, "warnings": warnings,
                 "steps": st.iteration, "tool_calls": st.tool_calls_used, "trace": trace,
                 "disclaimer": "Informational analysis only, not financial advice. Prices are end-of-day closes."}
-
-
-def _blocked(code, msg):
-    from state.schemas import fail
-    return fail(msg, code)
