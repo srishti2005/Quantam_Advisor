@@ -2,3 +2,7 @@ flask
 flask-cors
 requests
 openai
+pandas
+numpy
+openpyxl
+gunicorn

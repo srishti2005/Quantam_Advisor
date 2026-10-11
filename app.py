@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 import os
 import hashlib
 import secrets
@@ -11,17 +11,20 @@ from flask_cors import CORS
 
 from orchestrator import Orchestrator
 from agents.portfolio_analyzer import PortfolioAnalyzer
+from agent_routes import agent_bp, save_user_portfolio
 
 # ─────────────────────────────────────────────
 #  PATHS
 # ─────────────────────────────────────────────
 BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
-FRONTEND_DIR = os.path.join(BASE_DIR, "..", "frontend")
+FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
 DB_PATH      = os.path.join(BASE_DIR, "users.db")
 
 app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path="")
-app.secret_key = secrets.token_hex(32)
+app.secret_key = os.environ.get("SECRET_KEY", "dev-only-change-me")
 CORS(app, supports_credentials=True)
+
+app.register_blueprint(agent_bp)   # /api/agent
 
 orc           = Orchestrator()
 port_analyzer = PortfolioAnalyzer()
@@ -172,6 +175,7 @@ def upload_portfolio():
         if not (filename.endswith(".csv") or filename.endswith(".xlsx")):
             return jsonify({"error": "Only CSV or XLSX files accepted"}), 400
         result = port_analyzer.analyze_portfolio(file, filename)
+        save_user_portfolio(result)   # lets the agent read THIS user's holdings
         return jsonify(result)
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -193,4 +197,4 @@ def health():
 if __name__ == "__main__":
     print(f"\n✅ Frontend served from: {os.path.abspath(FRONTEND_DIR)}")
     print("✅ Open your browser at: http://127.0.0.1:5000\n")
-    app.run(debug=True)
+    app.run(debug=os.environ.get("FLASK_DEBUG") == "1")
